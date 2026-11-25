@@ -231,6 +231,21 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 100 * crate::resource::room_percent()
     {
+        // The first refusals, with the numbers that made them: run 9 kept
+        // 1 copy of 97 with the textures' rule leaving room for them, and
+        // said nothing of why.
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+            tracing::info!(
+                budget_mb = budget >> 20,
+                used_mb = used >> 20,
+                size_mb = size >> 20,
+                ceiling_mb = (budget / 100 * crate::resource::room_percent()) >> 20,
+                kept_for_copies_mb = card_reserve() >> 20,
+                copies_mb = CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+                "a buffer's copy stays in the PC's memory: the card is at its share of the budget"
+            );
+        }
         return None;
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
