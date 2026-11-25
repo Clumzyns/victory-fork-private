@@ -1125,6 +1125,9 @@ pub(crate) struct HostTexture {
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
+    /// The title texture's largest levels it leaves out ([`unmapped_top`]):
+    /// its level 0 is the title's level `skip`.
+    pub(crate) skip: u32,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1155,6 +1158,9 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    /// The title copies it on the GPU (`CopyResource`, `CopyTextureRegion`):
+    /// its host copy has every level, never fewer ([`full_size`]).
+    full: std::sync::atomic::AtomicBool,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1303,7 +1309,14 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+        // A texture the title fills, whose largest levels are not mapped
+        // yet: made without them ([`unmapped_top`]).
+        let skip = if fills(&r.desc) && !r.host.full.load(Relaxed) {
+            unmapped_top(r.data().cast_const(), &r.desc)
+        } else {
+            0
+        };
+        let Some(texture) = host_texture(&r.desc, r.host.state, clear, skip) else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1321,6 +1334,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
         let mut host = HostTexture::new(texture, state);
+        host.skip = skip;
+        if skip > 0 {
+            SKIPPED[0].fetch_add(1, Relaxed);
+            SKIPPED[1].fetch_add(u64::from(skip), Relaxed);
+        }
         host.filled = fills(&r.desc);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
@@ -1338,6 +1356,130 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     }
     r.host.used.store(crate::host::moment(), Relaxed);
     made.clone()
+}
+
+/// Host copies made without their largest levels ([`unmapped_top`]) since
+/// the start, and the levels left out; such copies made again with more
+/// levels once those were mapped ([`regrow`]).
+#[cfg(windows)]
+pub(crate) static SKIPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Whether host copies of textures the title fills leave out the largest
+/// levels whose memory is not mapped yet ([`unmapped_top`]):
+/// `VICTORY_TEXTURE_SKIP_UNMAPPED=0` makes every level, as before.
+#[cfg(windows)]
+fn skip_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SKIP_UNMAPPED").is_none_or(|v| v != "0"))
+}
+
+/// How many of a 2D texture's largest levels its host copy leaves out: those
+/// whose title memory is not mapped yet, from level 0 down to the first
+/// that is. The title streams a texture in from its small levels up, and
+/// the largest is the last to come: in run 16c 1,640 of 1,642 host copies
+/// with a level not mapped lacked their largest, 1,606 of 2,883 MB of
+/// such copies held levels with nothing in them, the card was past its
+/// budget and 22,462 textures waited for room, the main character's face
+/// among them (black in the G-buffer's colour). The copy is made again
+/// with more levels when more is mapped ([`regrow`]). At least one level is
+/// kept, and the top one stays a whole number of 4x4 blocks.
+#[cfg(windows)]
+fn unmapped_top(memory: *const u8, desc: &ResourceDesc) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    if !skip_on() || memory.is_null() || desc.dimension != TEXTURE_2D || desc.mip_levels < 2 {
+        return 0;
+    }
+    let Some(layout) = texture_layout(desc).map(|t| t.planes[0].layout.clone()) else {
+        return 0;
+    };
+    if layout.size == 0 || crate::texture::committed(memory, layout.size as usize) {
+        return 0;
+    }
+    // Every slice holds the whole chain: the levels of the tail in its first
+    // block, the others after it from the smallest up (as `card_accounting`
+    // reads them).
+    let mips = &layout.mips;
+    let tail = (layout.first_tail_mip as usize).min(mips.len());
+    let there = |from: u64, to: u64| {
+        (0..u64::from(layout.slices)).all(|slice| {
+            let at = memory as u64 + slice * layout.slice_size + from;
+            crate::texture::committed(at as *const u8, (to - from) as usize)
+        })
+    };
+    let mut skip = 0u32;
+    for (level, m) in mips.iter().enumerate().take(tail) {
+        let end = if level == 0 { layout.slice_size } else { mips[level - 1].offset };
+        if end <= m.offset || there(m.offset, end) {
+            break;
+        }
+        skip += 1;
+    }
+    let block = element(desc.format).map_or(1, |(_, w)| w);
+    while skip > 0 {
+        let (w, h) = (desc.width >> skip, u64::from(desc.height) >> skip);
+        if u32::from(desc.mip_levels) > skip && w >= block && h >= block && w % block == 0 && h % block == 0 {
+            break;
+        }
+        skip -= 1;
+    }
+    skip
+}
+
+/// If title texture `this`'s host copy leaves out levels that are mapped
+/// now, lets it go: the next use makes it with them ([`hosted`]). Whether
+/// it did. (The slots that showed the old copy keep it until they are
+/// written again: the upload pass writes them as their memory is mapped.)
+#[cfg(windows)]
+pub(crate) fn regrow(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return false;
+    }
+    let gone = {
+        let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((host, _)) = made.as_ref() else { return false };
+        if host.skip == 0 || unmapped_top(r.data().cast_const(), &r.desc) >= host.skip {
+            return false;
+        }
+        // Under the lock, as `let_go_idle` does: the next use must not find
+        // the old copy's staging buffer.
+        crate::texture::unstage(this);
+        made.take()
+    };
+    if let Some((host, _)) = gone {
+        SKIPPED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::host::retire(host);
+    }
+    true
+}
+
+/// Title texture `this` is copied on the GPU by the title (whole, or by
+/// level and layer): its host copy has every level from now on, made
+/// again if it lacked some. The copies name the title's levels.
+#[cfg(windows)]
+pub(crate) fn full_size(this: This) {
+    if this.is_null() {
+        return;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER || r.host.full.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let gone = {
+        let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        if made.as_ref().is_some_and(|(host, _)| host.skip > 0) {
+            crate::texture::unstage(this);
+            made.take()
+        } else {
+            None
+        }
+    };
+    if let Some((host, _)) = gone {
+        crate::host::retire(host);
+    }
 }
 
 /// The host copy of title texture `this` if it is made, without making it
@@ -1479,7 +1621,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
         return;
     }
     let began = std::time::Instant::now();
-    let mut copies: Vec<(usize, ResourceDesc, u64)> = Vec::new();
+    let mut copies: Vec<(usize, ResourceDesc, u64, usize)> = Vec::new();
     // Textures the title fills without a host copy: never one, one let go.
     let mut without = [0u64; 2];
     {
@@ -1492,7 +1634,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
             }
             let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             match made.as_ref() {
-                Some((host, _)) => copies.push((r.data() as usize, r.desc, host.bytes)),
+                Some((host, _)) => copies.push((r.data() as usize, r.desc, host.bytes, host.skip as usize)),
                 None => without[usize::from(r.host.gone.load(Relaxed))] += 1,
             }
         }
@@ -1513,7 +1655,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
         // a level not mapped; with the largest level not mapped; with no
         // level mapped; copies without a console layout (not asked).
         let mut c = [0u64; 7];
-        for &(memory, desc, bytes) in &copies {
+        for &(memory, desc, bytes, skip) in &copies {
             c[0] += 1;
             c[1] += bytes;
             let Some(layout) = texture_layout(&desc).map(|t| t.planes[0].layout.clone()) else {
@@ -1535,11 +1677,12 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
                     crate::texture::committed(at as *const u8, (to - from) as usize)
                 })
             };
-            let all: u64 = mips.iter().map(texels).sum::<u64>().max(1);
+            let all: u64 = mips.iter().skip(skip).map(texels).sum::<u64>().max(1);
             let (mut missing, mut any) = (0u64, false);
             for (level, m) in mips.iter().enumerate().take(tail) {
                 let end = if level == 0 { layout.slice_size } else { mips[level - 1].offset };
-                if end <= m.offset {
+                // (levels the host copy leaves out hold nothing on the card)
+                if end <= m.offset || level < skip {
                     continue;
                 }
                 if there(m.offset, end) {
@@ -1592,6 +1735,11 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
             [gone[0], gone[1] >> 20, gone[2], gone[3] >> 20, gone[4], gone[5] >> 20, gone[6]];
         let [let_go, let_go_mb, again, again_mb, made] = [since[0], since[1] >> 20, since[2], since[3] >> 20, since[4]];
         let walk_ms = began.elapsed().as_millis() as u64;
+        let [shrunk, shrunk_levels, regrown] = SKIPPED.each_ref().map(|k| k.load(Relaxed));
+        tracing::info!(
+            "card accounting: host copies made without their largest levels (not mapped yet) since the start: {shrunk} \
+             ({shrunk_levels} levels left out), {regrown} made again with more (VICTORY_TEXTURE_SKIP_UNMAPPED=0: none)"
+        );
         tracing::info!(
             "card accounting: room {room}, the card {used_mb} MB in use of a budget of {budget_mb} MB; host copies of textures the title \
              fills: {copies_n} alive {copies_mb} MB, of which {unmapped_mb} MB are levels whose title memory is not mapped ({partly} copies \
@@ -1777,6 +1925,7 @@ impl HostTexture {
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
+            skip: 0,
         }
     }
 }
@@ -1842,12 +1991,14 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 }
 
 /// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// without the console's layout and flags; without its `skip` largest
+/// levels (the title's level `skip` is its level 0: [`unmapped_top`]).
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
+    skip: u32,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
@@ -1856,6 +2007,11 @@ fn host_texture(
     }
     let host = crate::host::host()?;
     let mut d = *desc;
+    if skip > 0 {
+        d.width = (d.width >> skip).max(1);
+        d.height = (d.height >> skip).max(1);
+        d.mip_levels = d.mip_levels.saturating_sub(skip as u16).max(1);
+    }
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
@@ -1929,6 +2085,11 @@ fn host_texture(
     texture
 }
 
+/// The levels a resource description gives (0: the whole chain).
+pub(crate) fn mip_levels(desc: &ResourceDesc) -> u16 {
+    desc.mip_levels
+}
+
 /// A texture's console memory and description; `None` for buffers.
 pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     if this.is_null() {
@@ -2000,6 +2161,7 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
+            full: std::sync::atomic::AtomicBool::new(false),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).

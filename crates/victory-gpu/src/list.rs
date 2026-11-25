@@ -846,6 +846,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
+        // Both host copies with every level: the copy is of the title's
+        // (`crate::resource::full_size`; buffers are left alone).
+        crate::resource::full_size(dst);
+        crate::resource::full_size(src);
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -918,6 +922,10 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
+        // Both host copies with every level: the subresource indices are the
+        // title's (`crate::resource::full_size`; buffers are left alone).
+        crate::resource::full_size(dst.resource);
+        crate::resource::full_size(src.resource);
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the
@@ -1126,6 +1134,13 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
+    // Both host copies with every level: the subresource indices are the
+    // title's (`crate::resource::full_size`).
+    #[cfg(windows)]
+    {
+        crate::resource::full_size(dst);
+        crate::resource::full_size(src);
+    }
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (

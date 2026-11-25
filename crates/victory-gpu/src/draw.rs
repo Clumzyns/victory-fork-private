@@ -1857,6 +1857,21 @@ impl State {
                     );
                 }
             }
+            // A host copy made without its largest levels while they were not
+            // mapped, which are mapped now: let go (`resource::regrow`), so
+            // that the mirror below makes it again with them and writes the
+            // slot with a view of the new copy.
+            let title_texture = match heap.handle(index).and_then(crate::descriptor::view) {
+                Some(View::Placed(false, resource, desc)) if resource[0] != 1 => {
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    crate::resource::texture_at(address, &resource)
+                }
+                Some(View::Shader(object, _)) if crate::resource::title_fills(object as This) => Some(object as This),
+                _ => None,
+            };
+            if title_texture.is_some_and(crate::resource::regrow) {
+                host.texture_slot_stale(index);
+            }
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {

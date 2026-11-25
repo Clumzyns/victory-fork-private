@@ -1078,6 +1078,17 @@ impl HostHeap {
         self.keep(index, None);
     }
 
+    /// Title slot `index`'s host view is written again by the next
+    /// [`HostHeap::mirror`], though the title's view is the same: its
+    /// texture's host copy was made anew with more levels
+    /// (`crate::resource::regrow`). Not made null meanwhile: it shows the
+    /// old copy until then.
+    pub(crate) fn texture_slot_stale(&self, index: u32) {
+        if let Some(key) = self.made.lock().unwrap_or_else(|e| e.into_inner()).get_mut(index as usize) {
+            *key = 0;
+        }
+    }
+
     /// Title slot `index` is a table's ([`HostHeap::tabled`]). `read`: a
     /// draw read it through the table and brought what it views up to
     /// date, so the slot leaves the queue of textures picked by index; the
@@ -1570,6 +1581,43 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// A texture view of the title's levels made a view of a host copy without
+/// its `skip` largest levels: the first level and the levels counted from
+/// the copy's level 0 (the title's `skip`), levels above it left out, the
+/// lowest LOD clamp lowered as much. (`u32::MAX` levels: all from the first.)
+fn skip_levels(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, skip: u32) {
+    let shift = |most: &mut u32, levels: &mut u32, clamp: &mut f32| {
+        let gone = skip.saturating_sub(*most);
+        *most = most.saturating_sub(skip);
+        if *levels != u32::MAX {
+            *levels = levels.saturating_sub(gone).max(1);
+        }
+        *clamp = (*clamp - skip as f32).max(0.0);
+    };
+    // SAFETY: the union member the view dimension names.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut desc.Anonymous.Texture2D;
+                shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut desc.Anonymous.Texture2DArray;
+                shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let t = &mut desc.Anonymous.TextureCube;
+                shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let t = &mut desc.Anonymous.TextureCubeArray;
+                shift(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A view description from its words, with the format as the host has it.
@@ -2101,6 +2149,18 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
+                // A host copy without the title's largest levels
+                // (`crate::resource::unmapped_top`): the view's levels are
+                // counted from its own level 0, the title's level `skip`
+                // (from the two descriptions; no lock of the copy taken).
+                if let (Some(d), Some((_, title))) = (desc.as_mut(), crate::resource::texture_memory(resource)) {
+                    // SAFETY: a live texture.
+                    let own = unsafe { texture.GetDesc() }.MipLevels;
+                    let skip = u32::from(crate::resource::mip_levels(&title).saturating_sub(own));
+                    if skip > 0 {
+                        skip_levels(d, skip);
+                    }
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -2428,6 +2488,44 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A view of the title's levels on a host copy without its 2 largest:
+    /// levels are counted from the copy's level 0 (the title's level 2), the
+    /// ones above it left out, the LOD clamp lowered; the view stays within
+    /// the copy's levels (title 10 levels, copy 8).
+    #[test]
+    fn views_skip_the_levels_the_host_copy_leaves_out() {
+        let view = |most: u32, levels: u32, clamp: f32| {
+            let mut d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            d.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                MostDetailedMip: most,
+                MipLevels: levels,
+                PlaneSlice: 0,
+                ResourceMinLODClamp: clamp,
+            };
+            skip_levels(&mut d, 2);
+            // SAFETY: the member the dimension names.
+            let t = unsafe { d.Anonymous.Texture2D };
+            (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp)
+        };
+        // the whole chain: the copy's 8 levels
+        assert_eq!(view(0, 10, 0.0), (0, 8, 0.0));
+        // all levels from the first
+        assert_eq!(view(0, u32::MAX, 0.0), (0, u32::MAX, 0.0));
+        // from the title's level 1 (left out): from the copy's 0, 1 level fewer
+        assert_eq!(view(1, 9, 0.0), (0, 8, 0.0));
+        // from the title's level 5: the copy's level 3, as many levels
+        assert_eq!(view(5, 5, 6.0), (3, 5, 4.0));
+        // one level above the copy's: its level 0, one level
+        assert_eq!(view(0, 1, 0.0), (0, 1, 0.0));
+        for (most, levels) in [(0u32, 10u32), (1, 9), (5, 5), (2, 8), (3, 7), (9, 1)] {
+            let (m, l, _) = view(most, levels, 0.0);
+            assert!(m + l <= 8, "{most} {levels}: {m} {l}");
+        }
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

@@ -43,6 +43,10 @@ pub(crate) struct Staging {
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
+    /// The title's largest levels the host texture leaves out
+    /// (`crate::resource::unmapped_top`): its level `m` is the title's
+    /// level `m + skip`.
+    skip: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
@@ -854,7 +858,7 @@ impl Staging {
             };
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, mip + self.skip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
@@ -1140,6 +1144,10 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    // The levels the host texture leaves out, from the two descriptions (not
+    // asked of the title texture: its host copy's lock is taken before this
+    // map's elsewhere): the host texture's level 0 is the title's `skip`.
+    let skip = u32::from(crate::resource::mip_levels(&desc).saturating_sub(d.MipLevels));
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -1180,6 +1188,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        skip,
         bytes: total,
         memory,
         last: Mutex::default(),
