@@ -880,6 +880,21 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     Some((at as u64, len as u64))
 }
 
+/// Whether [`fingerprint`] hashes all of a texture's memory past 48 KiB
+/// (`VICTORY_HEAP_RECHECK_FULL=1`), not 16 KiB at three places: a texture
+/// whose other parts arrive later is then not missed (the faces left black
+/// with the three windows).
+fn full_fingerprint() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_HEAP_RECHECK_FULL").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("texture rechecks fingerprint all of a texture's memory (VICTORY_HEAP_RECHECK_FULL=1)");
+        }
+        on
+    })
+}
+
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
 /// it up to 48 KiB, else of 16 KiB at its start, its middle and its end
 /// (a texture streams in whole mips; the small ones lie first). Read
@@ -901,6 +916,15 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         };
         if len <= 3 * WINDOW {
             take(0, len);
+        } else if full_fingerprint() {
+            // `VICTORY_HEAP_RECHECK_FULL=1`: all of the memory, so a texture whose
+            // other parts arrive later is not missed (slower; a test of that gap).
+            let mut from = 0;
+            while from < len {
+                let bytes = (len - from).min(3 * WINDOW);
+                take(from, bytes);
+                from += bytes;
+            }
         } else {
             take(0, WINDOW);
             take((len / 2) & !0xfff, WINDOW);
