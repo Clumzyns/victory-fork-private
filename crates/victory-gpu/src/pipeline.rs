@@ -405,11 +405,15 @@ pub(crate) fn making() -> u64 {
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
-/// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+/// Shader hashes as printed in the pipeline diagnostics: comma-, space- or
+/// line-separated; `#` starts a comment to the end of its line (so a file
+/// can name each hash).
+#[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
-        .split(',')
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or(""))
+        .flat_map(|line| line.split([',', ' ', '\t']))
         .map(str::trim)
         .filter(|hash| !hash.is_empty())
         .filter_map(|hash| {
@@ -426,12 +430,32 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+/// Draws and dispatches of pipelines with a shader named in
+/// `VICTORY_SKIP_PIPELINES` (hashes) or in the file `VICTORY_SKIP_PIPELINES_FILE`
+/// are not run. In release builds too: the title's ray-tracing resolves
+/// (`CS_RaytracingResolve`, one per material) trace no structure while the
+/// builder is off, yet took 270 ms per submission on an RTX 5060 and one
+/// batch ran 3.4 s and lost the device (fork main c96b4f2).
+/// shortcut: what a skipped program would write stays as it was.
+#[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        let mut value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
+        if let Some(path) = std::env::var_os("VICTORY_SKIP_PIPELINES_FILE") {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    value.push('\n');
+                    value.push_str(&text);
+                }
+                Err(e) => tracing::warn!(path = %std::path::Path::new(&path).display(), error = %e, "VICTORY_SKIP_PIPELINES_FILE not read"),
+            }
+        }
+        let hashes: std::collections::HashSet<String> = parse_skip_hashes(&value).into_iter().collect();
+        if !hashes.is_empty() {
+            tracing::info!(shaders = hashes.len(), "pipelines with these shaders are skipped (VICTORY_SKIP_PIPELINES[_FILE])");
+        }
+        hashes
     });
     if hashes.is_empty() {
         return None;
@@ -442,7 +466,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
@@ -724,7 +748,7 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(windows)]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());
@@ -732,6 +756,14 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    /// The file form: a hash per line, `#` comments (with names in them).
+    #[cfg(windows)]
+    #[test]
+    fn skip_hashes_read_a_commented_file() {
+        let file = "# resolves\n05ba183058112919  # cutout_fence:CS_RaytracingResolve\r\n\n49F2638C5DDE0B23 # x 0011223344556677\n";
+        assert_eq!(super::parse_skip_hashes(file), ["05ba183058112919", "49f2638c5dde0b23"]);
     }
 
     use super::*;
