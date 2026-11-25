@@ -459,6 +459,14 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                     *counter(t, p.stage, 0) += 1;
                     match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
+                            // `VICTORY_EMIT_OUT=<dir>`: each emitted container as
+                            // `<code hash>.<stage>.dxil`, for `dxc -dumpbin`.
+                            if let Some(dir) = std::env::var_os("VICTORY_EMIT_OUT") {
+                                let dir = std::path::Path::new(&dir);
+                                let _ = std::fs::create_dir_all(dir);
+                                let name = format!("{}.{:?}.dxil", blake3::hash(&shader.dxil).to_hex(), p.stage);
+                                let _ = std::fs::write(dir.join(name), &shader.dxil);
+                            }
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);

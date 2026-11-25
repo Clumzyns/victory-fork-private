@@ -378,8 +378,9 @@ pub fn emit(
         // waves: this form puts group barriers inside branches and loops, and runs 121-124
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // has no barrier, stays on. `VICTORY_WAVE_WIDE_ONLY` turns it on for the programs it
+        // names alone ([`wide_listed`]).
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || wide_listed(c);
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -494,6 +495,32 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+}
+
+/// Whether the wave-wide form ([`widen`]) is allowed for this program alone:
+/// `VICTORY_WAVE_WIDE_ONLY=<code hash>,...` names programs by the BLAKE3 of their DXIL part,
+/// in hex, at least its first 8 digits (the `~` hash `victory translate --list` prints). The
+/// form is off for every program otherwise, since two programs of it (the particle light
+/// atlas) kept a dispatch on the card until the device was reset; on a 32-lane GPU the
+/// programs named are refused without it (`WaveSize(64)`). Part of the shader cache's key.
+fn wide_listed(c: &Container) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().trim_start_matches('~').to_ascii_lowercase())
+            .filter(|h| h.len() >= 8 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    });
+    if list.is_empty() {
+        return false;
+    }
+    let Some(dxil) = c.part(FourCC::DXIL) else {
+        return false;
+    };
+    let code = blake3::hash(dxil.data).to_hex();
+    list.iter().any(|h| code.starts_with(h.as_str()))
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane

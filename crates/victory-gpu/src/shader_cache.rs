@@ -72,6 +72,7 @@ fn build() -> &'static [u8; 32] {
                 translator.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
                 let switches = [
                     "VICTORY_WAVE_WIDE",
+                    "VICTORY_WAVE_WIDE_ONLY",
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
@@ -554,6 +555,7 @@ mod tests {
                 victory_shader::emit::group_sync(),
                 &[
                     "VICTORY_WAVE_WIDE",
+                    "VICTORY_WAVE_WIDE_ONLY",
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
