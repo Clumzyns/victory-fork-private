@@ -162,6 +162,20 @@ fn card_limits() -> (u64, u64) {
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// The card memory still kept for title buffers' copies: what is left of
+/// [`card_limits`]' allowance (0 with [`cards`] off). Textures picked by
+/// index stop that far below their share of the budget (`resource::room`).
+/// Without it the textures uploaded while the world loads filled the card
+/// before its buffers were made, and every buffer but one stayed in the
+/// PC's memory: 1 copy of 174 MB against 97 of 941 MB, and the GPU's time
+/// a frame 520 ms against 205 (runs 6 and 8).
+pub(crate) fn card_reserve() -> u64 {
+    if !cards() {
+        return 0;
+    }
+    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed))
+}
+
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
@@ -206,14 +220,16 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    // Only while the card has room: with this copy on it, a fifth of the
-    // budget the system gives us must still be free. Copies are made when
-    // the world loads, before the textures fill the card; the texture
-    // queue's own rule (`resource::room`: nine tenths of the budget) counts
-    // them, so the card's use stays where it was and the textures' share
-    // shrinks by the copies' bytes, at most `card_limits`' second number.
+    // Only while the card has room: with this copy on it, the card's use
+    // must stay within the textures' share of the budget
+    // (`resource::room_percent`, nine tenths). The textures stop short of
+    // that share by what is left of the copies' allowance
+    // ([`card_reserve`]), so a copy within the allowance fits even when the
+    // textures uploaded while loading came first. (It was a fifth of the
+    // budget kept free, below the textures' share: once they passed it no
+    // copy was ever made.)
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * crate::resource::room_percent()
     {
         return None;
     }

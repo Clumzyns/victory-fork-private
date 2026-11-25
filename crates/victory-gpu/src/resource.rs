@@ -1379,7 +1379,9 @@ pub(crate) fn room() -> bool {
         return true;
     }
     match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 100 * room_percent(),
+        // Short of the share by the card memory still kept for title
+        // buffers' copies (`shadow::card_reserve`).
+        Some([budget, used, ..]) => used + crate::shadow::card_reserve() < budget / 100 * room_percent(),
         None => filled < WITHOUT_BUDGET,
     }
 }
@@ -1392,7 +1394,7 @@ pub(crate) fn room() -> bool {
 /// 1 MiB up take 449 MB more of the card than before (941 against 492),
 /// and 94 gives the textures about that much back.
 #[cfg(windows)]
-fn room_percent() -> u64 {
+pub(crate) fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
