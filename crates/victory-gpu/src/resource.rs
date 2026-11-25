@@ -1371,6 +1371,9 @@ pub(crate) fn room() -> bool {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
         mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
     });
+    // The card memory kept for title buffers' copies is made before the
+    // first of these textures takes any (`shadow::balloon_fill`, once).
+    crate::shadow::balloon_fill();
     let filled = KINDS[1].load(Relaxed);
     if let Some(limit) = limit {
         return filled < limit;

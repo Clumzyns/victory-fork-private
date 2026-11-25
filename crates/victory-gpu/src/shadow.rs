@@ -169,11 +169,93 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// before its buffers were made, and every buffer but one stayed in the
 /// PC's memory: 1 copy of 174 MB against 97 of 941 MB, and the GPU's time
 /// a frame 520 ms against 205 (runs 6 and 8).
+/// What the balloon ([`BALLOON`]) already holds of it is not counted again:
+/// that memory is in the card's use already, which the textures' rule sees.
 pub(crate) fn card_reserve() -> u64 {
     if !cards() {
         return 0;
     }
-    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed))
+    card_limits()
+        .1
+        .saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed))
+        .saturating_sub(BALLOON_BYTES.load(Ordering::Relaxed))
+}
+
+/// The size of one block of the balloon.
+const BALLOON_BLOCK: u64 = 64 << 20;
+
+/// The card memory kept for title buffers' copies, made as soon as the
+/// host is there, before textures fill the card: blocks of
+/// [`BALLOON_BLOCK`] bytes up to [`card_limits`]' allowance, each let go
+/// just before a copy takes its place ([`balloon_take`]). Counting room was
+/// not enough: in runs 10 and 12 memory outside every rule (the title's
+/// placed textures, render targets, pipelines being made) took what was
+/// counted as kept, and the card was at its share when the buffers came,
+/// 445 MB of 1,024 placed. Memory that is made is in the card's use for
+/// every rule to see. `VICTORY_CARD_BALLOON=0`: none, as before.
+static BALLOON: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
+
+/// The bytes of [`BALLOON`]'s blocks alive.
+static BALLOON_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Makes [`BALLOON`] once: the allowance not yet taken by copies, in
+/// blocks, while the card keeps a fifth of its budget free besides.
+pub(crate) fn balloon_fill() {
+    static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    DONE.get_or_init(|| {
+        if !cards() || std::env::var_os("VICTORY_CARD_BALLOON").is_some_and(|v| v == "0") {
+            return;
+        }
+        let Some(host) = host() else { return };
+        if !host.card_ready() {
+            return;
+        }
+        let want = card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed));
+        let mut blocks = Vec::new();
+        let mut made = 0u64;
+        while made + BALLOON_BLOCK <= want {
+            if let Some([budget, used, ..]) = host.video_memory()
+                && used + BALLOON_BLOCK > budget / 10 * 8
+            {
+                break;
+            }
+            let Some(block) = host.uav_buffer(BALLOON_BLOCK) else { break };
+            crate::host::name(&block, || "card memory kept for title buffers' copies".to_owned());
+            blocks.push(block);
+            made += BALLOON_BLOCK;
+        }
+        BALLOON_BYTES.store(made, Ordering::Relaxed);
+        tracing::info!(
+            kept_mb = made >> 20,
+            wanted_mb = want >> 20,
+            "card memory kept for title buffers' copies until they are made (VICTORY_CARD_BALLOON=0: none)"
+        );
+        *BALLOON.lock().unwrap_or_else(|e| e.into_inner()) = blocks;
+    });
+}
+
+/// Bytes of balloon blocks let go and not yet taken by a copy (a block is
+/// let go whole; the copies after take the rest of it).
+static BALLOON_CREDIT: Mutex<u64> = Mutex::new(0);
+
+/// Room for a copy of `size` bytes from the balloon: what earlier blocks
+/// left over, then as many blocks let go as cover the rest. Whether it
+/// covers all of `size` (else the budget decides, as without a balloon).
+fn balloon_take(size: u64) -> bool {
+    let mut blocks = BALLOON.lock().unwrap_or_else(|e| e.into_inner());
+    let mut credit = BALLOON_CREDIT.lock().unwrap_or_else(|e| e.into_inner());
+    while *credit < size && blocks.pop().is_some() {
+        *credit += BALLOON_BLOCK;
+        BALLOON_BYTES.fetch_sub(BALLOON_BLOCK, Ordering::Relaxed);
+    }
+    if *credit >= size {
+        *credit -= size;
+        true
+    } else {
+        // (the last blocks did not cover it: what they gave is the card's again)
+        *credit = 0;
+        false
+    }
 }
 
 /// The share of the card's budget, in percent, up to which title buffers'
@@ -241,16 +323,26 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    // Only while the card has room: with this copy on it, the card's use
-    // must stay within the copies' share of the budget ([`copies_percent`],
-    // 95), above the textures' (`resource::room_percent`, 90). The textures
-    // also stop short of theirs by what is left of the copies' allowance
+    balloon_fill();
+    // Within the copies' allowance first, so that no balloon block is let
+    // go for a copy refused anyway.
+    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
+        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        return None;
+    }
+    // Room the balloon kept for it ([`balloon_take`]); else only while the
+    // card has room: with this copy on it, the card's use must stay within
+    // the copies' share of the budget ([`copies_percent`], 95), above the
+    // textures' (`resource::room_percent`, 90). The textures also stop
+    // short of theirs by what is left of the copies' allowance
     // ([`card_reserve`]). (It was a fifth of the budget kept free, below
     // the textures' share: once textures uploaded while loading passed it,
     // no copy was ever made.)
-    if let Some([budget, used, ..]) = host.video_memory()
+    if !balloon_take(size)
+        && let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 100 * copies_percent()
     {
+        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         // The first refusals, with the numbers that made them: run 9 kept
         // 1 copy of 97 with the textures' rule leaving room for them, and
         // said nothing of why.
@@ -263,13 +355,10 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
                 ceiling_mb = (budget / 100 * copies_percent()) >> 20,
                 kept_for_copies_mb = card_reserve() >> 20,
                 copies_mb = CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+                balloon_mb = BALLOON_BYTES.load(Ordering::Relaxed) >> 20,
                 "a buffer's copy stays in the PC's memory: the card is at its share of the budget"
             );
         }
-        return None;
-    }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return None;
     }
     let buffer = host.uav_buffer(size);
