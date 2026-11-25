@@ -176,6 +176,27 @@ pub(crate) fn card_reserve() -> u64 {
     card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed))
 }
 
+/// The share of the card's budget, in percent, up to which title buffers'
+/// copies are made: above the textures' share (`resource::room_percent`,
+/// 90) by `VICTORY_CARD_COPIES_PERCENT` (95 unless it says another, from
+/// that share to 98). The textures' rule keeping room ([`card_reserve`])
+/// was not enough alone: in run 10, with a budget of 6,737 MB, the card
+/// was at the textures' share when the buffers came, 554 MB of the
+/// allowance kept and taken by memory that rule does not count (the
+/// title's own placed textures, render targets), and 44 copies were
+/// refused. What is above the textures' share only copies take.
+pub(crate) fn copies_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        let least = crate::resource::room_percent();
+        std::env::var("VICTORY_CARD_COPIES_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(95, |percent| percent.clamp(least, 98))
+            .max(least)
+    })
+}
+
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
@@ -221,15 +242,14 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     // Only while the card has room: with this copy on it, the card's use
-    // must stay within the textures' share of the budget
-    // (`resource::room_percent`, nine tenths). The textures stop short of
-    // that share by what is left of the copies' allowance
-    // ([`card_reserve`]), so a copy within the allowance fits even when the
-    // textures uploaded while loading came first. (It was a fifth of the
-    // budget kept free, below the textures' share: once they passed it no
-    // copy was ever made.)
+    // must stay within the copies' share of the budget ([`copies_percent`],
+    // 95), above the textures' (`resource::room_percent`, 90). The textures
+    // also stop short of theirs by what is left of the copies' allowance
+    // ([`card_reserve`]). (It was a fifth of the budget kept free, below
+    // the textures' share: once textures uploaded while loading passed it,
+    // no copy was ever made.)
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * crate::resource::room_percent()
+        && used + size > budget / 100 * copies_percent()
     {
         // The first refusals, with the numbers that made them: run 9 kept
         // 1 copy of 97 with the textures' rule leaving room for them, and
@@ -240,7 +260,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
                 budget_mb = budget >> 20,
                 used_mb = used >> 20,
                 size_mb = size >> 20,
-                ceiling_mb = (budget / 100 * crate::resource::room_percent()) >> 20,
+                ceiling_mb = (budget / 100 * copies_percent()) >> 20,
                 kept_for_copies_mb = card_reserve() >> 20,
                 copies_mb = CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
                 "a buffer's copy stays in the PC's memory: the card is at its share of the budget"
